@@ -1,5 +1,15 @@
 package burp;
 
+import burp.api.montoya.BurpExtension;
+import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.extension.ExtensionUnloadingHandler;
+import burp.api.montoya.http.message.HttpRequestResponse;
+import burp.api.montoya.http.message.responses.HttpResponse;
+import burp.api.montoya.logging.Logging;
+import burp.api.montoya.ui.Selection;
+import burp.api.montoya.ui.editor.extension.EditorCreationContext;
+import burp.api.montoya.ui.editor.extension.ExtensionProvidedHttpResponseEditor;
+import burp.api.montoya.ui.editor.extension.HttpResponseEditorProvider;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Component;
@@ -9,8 +19,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Arrays;
-import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.InflaterInputStream;
 import javax.imageio.ImageIO;
@@ -19,106 +31,116 @@ import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.SwingConstants;
+import javax.swing.SwingUtilities;
 
 /**
- * Image Viewer extension for Burp Suite. Renders common image responses inline,
- * similar to the PDF Reader extension but focused on image formats.
+ * Image Viewer extension for Burp Suite using the Montoya API.
+ * Renders common image responses in a dedicated "Image" tab without
+ * blocking the UI thread.
  */
-public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory {
+public class BurpExtender implements BurpExtension, HttpResponseEditorProvider, ExtensionUnloadingHandler {
 
-    private IBurpExtenderCallbacks callbacks;
-    private IExtensionHelpers helpers;
+    private MontoyaApi api;
+    private ExecutorService worker;
 
     @Override
-    public void registerExtenderCallbacks(IBurpExtenderCallbacks callbacks) {
-        this.callbacks = callbacks;
-        this.helpers = callbacks.getHelpers();
+    public void initialize(MontoyaApi api) {
+        this.api = api;
+        this.worker = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "image-viewer-worker");
+            t.setDaemon(true);
+            return t;
+        });
 
-        callbacks.setExtensionName("Image Viewer");
-        callbacks.registerMessageEditorTabFactory(this);
-        callbacks.printOutput("Image Viewer: renders images from responses.");
+        api.extension().setName("Image Viewer");
+        api.extension().registerUnloadingHandler(this);
+        api.userInterface().registerHttpResponseEditorProvider(this);
+        api.logging().logToOutput("Image Viewer: renders image responses.");
     }
 
     @Override
-    public IMessageEditorTab createNewInstance(IMessageEditorController controller, boolean editable) {
-        return new ImageViewerTab(controller, helpers);
+    public ExtensionProvidedHttpResponseEditor provideHttpResponseEditor(EditorCreationContext context) {
+        return new ImageResponseEditor(api, worker);
     }
 
-    private static final class ImageViewerTab implements IMessageEditorTab {
-        private final IMessageEditorController controller;
-        private final IExtensionHelpers helpers;
+    @Override
+    public void extensionUnloaded() {
+        if (worker != null) {
+            worker.shutdownNow();
+        }
+    }
+
+    private static final class ImageResponseEditor implements ExtensionProvidedHttpResponseEditor {
+        private final MontoyaApi api;
+        private final Logging log;
+        private final ExecutorService worker;
         private final JPanel panel;
         private final JLabel imageLabel;
-        private final JScrollPane scrollPane;
-        private byte[] currentMessage;
 
-        ImageViewerTab(IMessageEditorController controller, IExtensionHelpers helpers) {
-            this.controller = controller;
-            this.helpers = helpers;
+        private Future<?> currentTask;
+        private HttpRequestResponse current;
+
+        ImageResponseEditor(MontoyaApi api, ExecutorService worker) {
+            this.api = api;
+            this.worker = worker;
+            this.log = api.logging();
+
             this.panel = new JPanel(new BorderLayout());
-
             this.imageLabel = new JLabel("", SwingConstants.CENTER);
             this.imageLabel.setVerticalAlignment(SwingConstants.TOP);
             this.imageLabel.setForeground(Color.GRAY);
 
-            this.scrollPane = new JScrollPane(imageLabel);
+            JScrollPane scrollPane = new JScrollPane(imageLabel);
             panel.add(scrollPane, BorderLayout.CENTER);
         }
 
         @Override
-        public String getTabCaption() {
-            return "Image";
-        }
+        public void setRequestResponse(HttpRequestResponse httpRequestResponse) {
+            this.current = httpRequestResponse;
+            cancelCurrentTask();
 
-        @Override
-        public Component getUiComponent() {
-            return panel;
-        }
-
-        @Override
-        public boolean isEnabled(byte[] content, boolean isRequest) {
-            if (content == null || isRequest) {
-                return false;
-            }
-
-            IResponseInfo info = helpers.analyzeResponse(content);
-            if (info == null) {
-                return false;
-            }
-
-            List<String> headers = info.getHeaders();
-            String contentType = headerValue(headers, "Content-Type");
-            if (contentType != null && contentType.toLowerCase(Locale.ROOT).startsWith("image/")) {
-                return true;
-            }
-
-            int bodyOffset = info.getBodyOffset();
-            return MagicSniffer.looksLikeImage(content, bodyOffset);
-        }
-
-        @Override
-        public void setMessage(byte[] content, boolean isRequest) {
-            this.currentMessage = content;
-
-            if (content == null || isRequest) {
+            if (httpRequestResponse == null || httpRequestResponse.response() == null) {
                 showInfo("No response to render.");
                 return;
             }
 
-            try {
-                IResponseInfo info = helpers.analyzeResponse(content);
-                int bodyOffset = info.getBodyOffset();
-                byte[] body = Arrays.copyOfRange(content, bodyOffset, content.length);
-                byte[] decodedBody = decodeBody(body, info.getHeaders());
-                renderImage(decodedBody);
-            } catch (Exception e) {
-                showInfo("Unable to render image: " + e.getMessage());
-            }
+            showInfo("Rendering image...");
+            currentTask = worker.submit(() -> renderAsync(httpRequestResponse.response()));
         }
 
         @Override
-        public byte[] getMessage() {
-            return currentMessage;
+        public HttpResponse getResponse() {
+            return current != null ? current.response() : null;
+        }
+
+        @Override
+        public boolean isEnabledFor(HttpRequestResponse requestResponse) {
+            if (requestResponse == null || requestResponse.response() == null) {
+                return false;
+            }
+
+            HttpResponse response = requestResponse.response();
+            String contentType = response.headerValue("Content-Type");
+            if (contentType != null && contentType.toLowerCase(Locale.ROOT).startsWith("image/")) {
+                return true;
+            }
+
+            return MagicSniffer.looksLikeImage(response.body().getBytes(), 0);
+        }
+
+        @Override
+        public String caption() {
+            return "Image";
+        }
+
+        @Override
+        public Component uiComponent() {
+            return panel;
+        }
+
+        @Override
+        public Selection selectedData() {
+            return null;
         }
 
         @Override
@@ -126,54 +148,68 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory {
             return false;
         }
 
-        @Override
-        public byte[] getSelectedData() {
-            return null;
+        private void renderAsync(HttpResponse response) {
+            try {
+                byte[] body = decodeBody(response.body().getBytes(), response.headerValue("Content-Encoding"));
+                BufferedImage image = readImage(body);
+
+                if (image == null) {
+                    updateLabel("Response is not a supported image.", null);
+                } else {
+                    ImageIcon icon = new ImageIcon(image);
+                    updateLabel("", icon);
+                }
+            } catch (Exception e) {
+                logException("Unable to render image", e);
+                updateLabel("Unable to render image: " + e.getMessage(), null);
+            }
         }
 
-        private void renderImage(byte[] body) throws IOException {
-            if (body == null || body.length == 0) {
-                showInfo("Empty response body.");
-                return;
-            }
-
-            BufferedImage bufferedImage;
-            try (ByteArrayInputStream in = new ByteArrayInputStream(body)) {
-                bufferedImage = ImageIO.read(in);
-            }
-
-            if (bufferedImage == null) {
-                showInfo("Response is not a supported image.");
-                return;
-            }
-
-            imageLabel.setIcon(new ImageIcon(bufferedImage));
-            imageLabel.setText("");
+        private void updateLabel(String text, ImageIcon icon) {
+            SwingUtilities.invokeLater(() -> {
+                imageLabel.setText(text);
+                imageLabel.setIcon(icon);
+            });
         }
 
         private void showInfo(String text) {
-            imageLabel.setIcon(null);
-            imageLabel.setText(text);
+            updateLabel(text, null);
         }
 
-        private String headerValue(List<String> headers, String headerName) {
-            String lowered = headerName.toLowerCase(Locale.ROOT);
-            for (String header : headers) {
-                int idx = header.indexOf(':');
-                if (idx > 0 && header.substring(0, idx).trim().toLowerCase(Locale.ROOT).equals(lowered)) {
-                    return header.substring(idx + 1).trim();
-                }
+        private void cancelCurrentTask() {
+            if (currentTask != null) {
+                currentTask.cancel(true);
+                currentTask = null;
             }
-            return null;
         }
 
-        private byte[] decodeBody(byte[] body, List<String> headers) throws IOException {
-            String encoding = headerValue(headers, "Content-Encoding");
-            if (encoding == null) {
+        private void logException(String message, Exception e) {
+            log.logToError(message + ": " + e.getMessage());
+            if (log.error() != null) {
+                e.printStackTrace(log.error());
+            }
+        }
+
+        private BufferedImage readImage(byte[] body) throws IOException {
+            if (body == null || body.length == 0) {
+                return null;
+            }
+
+            try (ByteArrayInputStream in = new ByteArrayInputStream(body)) {
+                return ImageIO.read(in);
+            }
+        }
+
+        private byte[] decodeBody(byte[] body, String encodingHeader) throws IOException {
+            if (body == null) {
+                return null;
+            }
+
+            if (encodingHeader == null) {
                 return body;
             }
 
-            String lowered = encoding.toLowerCase(Locale.ROOT);
+            String lowered = encodingHeader.toLowerCase(Locale.ROOT);
             if (lowered.contains("gzip")) {
                 try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(body))) {
                     return readAll(gis);
