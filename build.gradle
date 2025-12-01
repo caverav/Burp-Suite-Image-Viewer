@@ -1,0 +1,27 @@
+plugins {
+    id 'java'
+}
+
+group = 'com.burp.extensions'
+version = '0.2.0'
+
+sourceCompatibility = JavaVersion.VERSION_17
+targetCompatibility = JavaVersion.VERSION_17
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    compileOnly 'net.portswigger.burp.extensions:montoya-api:2025.5'
+}
+
+jar {
+    archiveBaseName = 'burp-image-viewer'
+    manifest {
+        attributes(
+                'Implementation-Title': 'Burp Image Viewer',
+                'Implementation-Version': version
+        )
+    }
+}
