@@ -21,7 +21,7 @@
       packages = forAllSystems (pkgs: {
         default = pkgs.stdenv.mkDerivation {
           pname = "burp-image-viewer";
-          version = "0.2.0";
+          version = "0.3.0";
           src = ./.;
           nativeBuildInputs = [ pkgs.jdk17 pkgs.gradle ];
 
